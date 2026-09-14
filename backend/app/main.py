@@ -269,38 +269,324 @@ def delete_library(lid:int,user=Depends(current_user)):
 @app.post('/api/quiz/generate')
 def quiz_generate(data:GenerateIn,user=Depends(current_user)):
     text=data.source_text or ''
-    if data.document_id: text=document_for(user['id'],data.document_id)['extracted_text'] or ''
-    if not text.strip(): raise HTTPException(400,'No source content is available.')
-    prompt=f"Generate a quiz from the source. Return ONLY valid JSON: {{\"questions\":[{{\"question\":\"...\",\"options\":[\"...\",\"...\",\"...\",\"...\"],\"answer\":0,\"explanation\":\"...\",\"difficulty\":\"Easy|Medium|Hard\"}}]}}. Create 10 questions unless source is too short. Language: {data.language}."
-    try: raw=AIService().chat(prompt,text,data.language,data.response_style)
-    except AIConfigError as e: raise HTTPException(503,str(e))
-    except AIServiceError: raise HTTPException(502,'AI service is temporarily unavailable. Please try again.')
+
+    if data.document_id:
+        doc=document_for(user['id'],data.document_id)
+        if not doc:
+            raise HTTPException(404,'Document not found.')
+        text=doc['extracted_text'] or ''
+
+    if not text.strip():
+        raise HTTPException(400,'No source content is available.')
+
+    # Keep source manageable for llama3.2:3b
+    source=text[:30000]
+
+    prompt=f"""Create exactly 10 multiple-choice questions from the supplied source.
+
+Return ONLY a JSON object.
+Do NOT write any text before or after the JSON.
+Do NOT use Markdown.
+
+Required format:
+
+{{
+  "questions": [
+    {{
+      "question": "Question text",
+      "options": [
+        "Option A",
+        "Option B",
+        "Option C",
+        "Option D"
+      ],
+      "answer": 0,
+      "explanation": "Short explanation",
+      "difficulty": "Easy"
+    }}
+  ]
+}}
+
+Rules:
+- Each question must have exactly 4 options.
+- "answer" must be a number from 0 to 3.
+- "difficulty" must be exactly Easy, Medium, or Hard.
+- Every question must have a non-empty explanation.
+- Use only information supported by the source.
+- Language: {data.language}
+"""
+
     try:
-        clean=raw.strip().removeprefix('```json').removesuffix('```').strip(); obj=json.loads(clean)
+        raw=AIService().chat(
+            prompt,
+            source,
+            data.language,
+            data.response_style
+        )
+    except AIConfigError as e:
+        raise HTTPException(503,str(e))
+    except AIServiceError as e:
+        print("QUIZ AI ERROR:",str(e))
+        raise HTTPException(
+            502,
+            'AI service is temporarily unavailable. Please try again.'
+        )
+
+    try:
+        clean=raw.strip()
+
+        if '```' in clean:
+            clean=clean.replace('```json','').replace('```JSON','').replace('```','').strip()
+
+        start=clean.find('{')
+        end=clean.rfind('}')
+
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError('No JSON object found.')
+
+        clean=clean[start:end+1]
+
+        obj=json.loads(clean)
+
         questions=obj.get('questions',[])
-        if not questions: raise ValueError()
-    except Exception: raise HTTPException(502,'The AI returned an invalid quiz format. Please retry.')
-    conn=db(); cur=conn.execute('INSERT INTO quizzes(user_id,source_id,questions,created_at) VALUES(?,?,?,?)',(user['id'],data.document_id,json.dumps(questions),now())); qid=cur.lastrowid
-    conn.execute('INSERT INTO history(user_id,item_type,title,source_id,created_at,content) VALUES(?,?,?,?,?,?)',(user['id'],'Quiz','AI Quiz',data.document_id,now(),json.dumps(questions))); conn.commit(); conn.close()
-    return {'id':qid,'questions':questions}
+
+        if not isinstance(questions,list) or not questions:
+            raise ValueError('questions is empty.')
+
+        valid_questions=[]
+
+        for q in questions:
+
+            if not isinstance(q,dict):
+                continue
+
+            question=str(q.get('question','')).strip()
+            options=q.get('options',[])
+            answer=q.get('answer',0)
+            explanation=str(q.get('explanation','')).strip()
+            difficulty=str(q.get('difficulty','Medium')).strip()
+
+            if not question:
+                continue
+
+            if not isinstance(options,list) or len(options) != 4:
+                continue
+
+            options=[
+                str(option).strip()
+                for option in options
+            ]
+
+            if any(not option for option in options):
+                continue
+
+            try:
+                answer=int(answer)
+            except:
+                continue
+
+            if answer < 0 or answer > 3:
+                continue
+
+            if difficulty not in ['Easy','Medium','Hard']:
+                difficulty='Medium'
+
+            if not explanation:
+                explanation='Based on the supplied source.'
+
+            valid_questions.append({
+                'question':question,
+                'options':options,
+                'answer':answer,
+                'explanation':explanation,
+                'difficulty':difficulty
+            })
+
+        if not valid_questions:
+            raise ValueError('No valid questions.')
+
+        questions=valid_questions[:10]
+
+    except Exception as e:
+        print("QUIZ FORMAT ERROR:",str(e))
+        print("RAW AI RESPONSE:",raw[:5000])
+
+        raise HTTPException(
+            502,
+            'The AI returned an invalid quiz format. Please retry.'
+        )
+
+    conn=db()
+
+    cur=conn.execute(
+        'INSERT INTO quizzes(user_id,source_id,questions,created_at) VALUES(?,?,?,?)',
+        (
+            user['id'],
+            data.document_id,
+            json.dumps(questions),
+            now()
+        )
+    )
+
+    qid=cur.lastrowid
+
+    conn.execute(
+        'INSERT INTO history(user_id,item_type,title,source_id,created_at,content) VALUES(?,?,?,?,?,?)',
+        (
+            user['id'],
+            'Quiz',
+            'AI Quiz',
+            data.document_id,
+            now(),
+            json.dumps(questions)
+        )
+    )
+
+    conn.commit()
+
+    conn.close()
+
+    return {
+        'id':qid,
+        'questions':questions
+    }
 
 @app.post('/api/flashcards/generate')
 def flashcards_generate(data:GenerateIn,user=Depends(current_user)):
     text=data.source_text or ''
-    if data.document_id: text=document_for(user['id'],data.document_id)['extracted_text'] or ''
-    if not text.strip(): raise HTTPException(400,'No source content is available.')
-    prompt="Return ONLY valid JSON: {\"cards\":[{\"front\":\"question/term\",\"back\":\"answer\"}]}. Generate 12 useful flashcards from the source."
-    try: raw=AIService().chat(prompt,text,data.language,data.response_style)
-    except AIConfigError as e: raise HTTPException(503,str(e))
-    except AIServiceError: raise HTTPException(502,'AI service is temporarily unavailable. Please try again.')
-    try:
-        clean=raw.strip().removeprefix('```json').removesuffix('```').strip(); obj=json.loads(clean); cards=obj.get('cards',[])
-        if not cards: raise ValueError()
-    except Exception: raise HTTPException(502,'The AI returned an invalid flashcard format. Please retry.')
-    conn=db(); cur=conn.execute('INSERT INTO flashcards(user_id,source_id,cards,created_at) VALUES(?,?,?,?)',(user['id'],data.document_id,json.dumps(cards),now()))
-    conn.execute('INSERT INTO history(user_id,item_type,title,source_id,created_at,content) VALUES(?,?,?,?,?,?)',(user['id'],'Flashcards','AI Flashcards',data.document_id,now(),json.dumps(cards))); conn.commit(); fid=cur.lastrowid; conn.close()
-    return {'id':fid,'cards':cards}
 
+    if data.document_id:
+        doc=document_for(user['id'],data.document_id)
+        if not doc:
+            raise HTTPException(404,'Document not found.')
+        text=doc['extracted_text'] or ''
+
+    if not text.strip():
+        raise HTTPException(400,'No source content is available.')
+
+    # Keep the prompt/source smaller for llama3.2:3b.
+    # Very large PDF text can cause Ollama context errors.
+    source=text[:30000]
+
+    prompt="""Create exactly 12 useful flashcards from the supplied source.
+
+Return ONLY a JSON object.
+Do NOT write explanations before or after the JSON.
+Do NOT use Markdown.
+
+Required format:
+{
+  "cards": [
+    {
+      "front": "question or term",
+      "back": "answer"
+    }
+  ]
+}
+
+Every card must contain a non-empty "front" and non-empty "back".
+Use only information supported by the source."""
+
+    try:
+        raw=AIService().chat(
+            prompt,
+            source,
+            data.language,
+            data.response_style
+        )
+    except AIConfigError as e:
+        raise HTTPException(503,str(e))
+    except AIServiceError as e:
+        print("FLASHCARD AI ERROR:",str(e))
+        raise HTTPException(
+            502,
+            'AI service is temporarily unavailable. Please try again.'
+        )
+
+    # More tolerant JSON extraction
+    try:
+        clean=raw.strip()
+
+        if '```' in clean:
+            clean=clean.replace('```json','').replace('```JSON','').replace('```','').strip()
+
+        start=clean.find('{')
+        end=clean.rfind('}')
+
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError('No JSON object found.')
+
+        clean=clean[start:end+1]
+
+        obj=json.loads(clean)
+        cards=obj.get('cards',[])
+
+        if not isinstance(cards,list) or not cards:
+            raise ValueError('cards is empty.')
+
+        valid_cards=[]
+
+        for card in cards:
+            if not isinstance(card,dict):
+                continue
+
+            front=str(card.get('front','')).strip()
+            back=str(card.get('back','')).strip()
+
+            if front and back:
+                valid_cards.append({
+                    'front':front,
+                    'back':back
+                })
+
+        if not valid_cards:
+            raise ValueError('No valid cards.')
+
+        cards=valid_cards[:12]
+
+    except Exception as e:
+        print("FLASHCARD FORMAT ERROR:",str(e))
+        print("RAW AI RESPONSE:",raw[:5000])
+
+        raise HTTPException(
+            502,
+            'The AI returned an invalid flashcard format. Please retry.'
+        )
+
+    conn=db()
+
+    cur=conn.execute(
+        'INSERT INTO flashcards(user_id,source_id,cards,created_at) VALUES(?,?,?,?)',
+        (
+            user['id'],
+            data.document_id,
+            json.dumps(cards),
+            now()
+        )
+    )
+
+    conn.execute(
+        'INSERT INTO history(user_id,item_type,title,source_id,created_at,content) VALUES(?,?,?,?,?,?)',
+        (
+            user['id'],
+            'Flashcards',
+            'AI Flashcards',
+            data.document_id,
+            now(),
+            json.dumps(cards)
+        )
+    )
+
+    conn.commit()
+
+    fid=cur.lastrowid
+
+    conn.close()
+
+    return {
+        'id':fid,
+        'cards':cards
+    }
 @app.post('/api/quiz/score/{qid}')
 def quiz_score(qid:int,data:QuizScoreIn,user=Depends(current_user)):
     conn=db(); conn.execute('UPDATE quizzes SET score=? WHERE id=? AND user_id=?',(data.score,qid,user['id'])); conn.commit(); conn.close(); return {'ok':True}
