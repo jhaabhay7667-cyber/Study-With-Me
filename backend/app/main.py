@@ -267,32 +267,44 @@ def delete_library(lid:int,user=Depends(current_user)):
 
 
 @app.post('/api/quiz/generate')
-def quiz_generate(data:GenerateIn,user=Depends(current_user)):
-    text=data.source_text or ''
+def quiz_generate(data: GenerateIn, user=Depends(current_user)):
+
+    text = data.source_text or ''
 
     if data.document_id:
-        doc=document_for(user['id'],data.document_id)
+        doc = document_for(user['id'], data.document_id)
+
         if not doc:
-            raise HTTPException(404,'Document not found.')
-        text=doc['extracted_text'] or ''
+            raise HTTPException(
+                404,
+                'Document not found.'
+            )
+
+        text = doc.get('extracted_text') or ''
 
     if not text.strip():
-        raise HTTPException(400,'No source content is available.')
+        raise HTTPException(
+            400,
+            'No source content is available.'
+        )
 
-    # Keep source manageable for llama3.2:3b
-    source=text[:30000]
+    # Keep the source small enough for llama3.2:3b
+    source = text[:30000]
 
-    prompt=f"""Create exactly 10 multiple-choice questions from the supplied source.
+    prompt = """
+Create a multiple-choice quiz from the supplied source.
 
-Return ONLY a JSON object.
-Do NOT write any text before or after the JSON.
-Do NOT use Markdown.
+IMPORTANT:
+Return ONLY valid JSON.
+Do not write anything before or after the JSON.
+Do not use Markdown.
+Do not use ```json.
 
-Required format:
+The JSON MUST have exactly this structure:
 
-{{
+{
   "questions": [
-    {{
+    {
       "question": "Question text",
       "options": [
         "Option A",
@@ -303,76 +315,147 @@ Required format:
       "answer": 0,
       "explanation": "Short explanation",
       "difficulty": "Easy"
-    }}
+    }
   ]
-}}
+}
 
 Rules:
-- Each question must have exactly 4 options.
-- "answer" must be a number from 0 to 3.
-- "difficulty" must be exactly Easy, Medium, or Hard.
-- Every question must have a non-empty explanation.
-- Use only information supported by the source.
-- Language: {data.language}
+
+- Generate 10 questions.
+- Every question must have exactly 4 options.
+- The answer must be a number from 0 to 3.
+- The answer number identifies the correct option.
+- difficulty must be exactly Easy, Medium, or Hard.
+- Questions must be based on the supplied source.
+- Do not invent information.
+- Keep questions short and clear.
+- Keep explanations short.
+- Use the requested language.
 """
 
     try:
-        raw=AIService().chat(
+
+        raw = AIService().chat(
             prompt,
             source,
             data.language,
             data.response_style
         )
+
+        print("\n==============================")
+        print("RAW QUIZ AI RESPONSE")
+        print("==============================")
+        print(raw)
+        print("==============================\n")
+
     except AIConfigError as e:
-        raise HTTPException(503,str(e))
+
+        print("QUIZ CONFIG ERROR:", str(e))
+
+        raise HTTPException(
+            503,
+            str(e)
+        )
+
     except AIServiceError as e:
-        print("QUIZ AI ERROR:",str(e))
+
+        print("QUIZ AI ERROR:", str(e))
+
         raise HTTPException(
             502,
             'AI service is temporarily unavailable. Please try again.'
         )
 
+    # -----------------------------------------
+    # CLEAN AI RESPONSE
+    # -----------------------------------------
+
     try:
-        clean=raw.strip()
 
-        if '```' in clean:
-            clean=clean.replace('```json','').replace('```JSON','').replace('```','').strip()
+        clean = raw.strip()
 
-        start=clean.find('{')
-        end=clean.rfind('}')
+        # Remove markdown fences if model adds them
+        if clean.startswith("```"):
+            clean = clean.replace("```json", "", 1)
+            clean = clean.replace("```JSON", "", 1)
 
-        if start == -1 or end == -1 or end <= start:
-            raise ValueError('No JSON object found.')
+            if clean.endswith("```"):
+                clean = clean[:-3]
 
-        clean=clean[start:end+1]
+            clean = clean.strip()
 
-        obj=json.loads(clean)
+        # Find JSON object inside extra text
+        start = clean.find("{")
+        end = clean.rfind("}")
 
-        questions=obj.get('questions',[])
+        if start == -1 or end == -1:
+            print("QUIZ FORMAT ERROR: No JSON object found.")
+            print("RAW AI RESPONSE:", raw)
 
-        if not isinstance(questions,list) or not questions:
-            raise ValueError('questions is empty.')
+            raise ValueError(
+                "No JSON object found."
+            )
 
-        valid_questions=[]
+        clean = clean[start:end + 1]
+
+        obj = json.loads(clean)
+
+        questions = obj.get("questions")
+
+        if not isinstance(questions, list):
+            raise ValueError(
+                "questions is not a list"
+            )
+
+        if not questions:
+            raise ValueError(
+                "No questions returned"
+            )
+
+        # -----------------------------------------
+        # VALIDATE QUESTIONS
+        # -----------------------------------------
+
+        valid_questions = []
 
         for q in questions:
 
-            if not isinstance(q,dict):
+            if not isinstance(q, dict):
                 continue
 
-            question=str(q.get('question','')).strip()
-            options=q.get('options',[])
-            answer=q.get('answer',0)
-            explanation=str(q.get('explanation','')).strip()
-            difficulty=str(q.get('difficulty','Medium')).strip()
+            question = str(
+                q.get("question", "")
+            ).strip()
 
+            options = q.get("options", [])
+
+            explanation = str(
+                q.get("explanation", "")
+            ).strip()
+
+            difficulty = str(
+                q.get("difficulty", "Medium")
+            ).strip()
+
+            answer = q.get("answer")
+
+            # Basic validation
             if not question:
                 continue
 
-            if not isinstance(options,list) or len(options) != 4:
+            if not isinstance(options, list):
                 continue
 
-            options=[
+            if len(options) != 4:
+                continue
+
+            if not isinstance(answer, int):
+                continue
+
+            if answer < 0 or answer > 3:
+                continue
+
+            options = [
                 str(option).strip()
                 for option in options
             ]
@@ -380,76 +463,118 @@ Rules:
             if any(not option for option in options):
                 continue
 
-            try:
-                answer=int(answer)
-            except:
-                continue
-
-            if answer < 0 or answer > 3:
-                continue
-
-            if difficulty not in ['Easy','Medium','Hard']:
-                difficulty='Medium'
-
             if not explanation:
-                explanation='Based on the supplied source.'
+                explanation = (
+                    "The correct answer is supported "
+                    "by the supplied source."
+                )
 
-            valid_questions.append({
-                'question':question,
-                'options':options,
-                'answer':answer,
-                'explanation':explanation,
-                'difficulty':difficulty
-            })
+            if difficulty not in [
+                "Easy",
+                "Medium",
+                "Hard"
+            ]:
+                difficulty = "Medium"
+
+            valid_questions.append(
+                {
+                    "question": question,
+                    "options": options,
+                    "answer": answer,
+                    "explanation": explanation,
+                    "difficulty": difficulty
+                }
+            )
+
+        # -----------------------------------------
+        # CHECK RESULT
+        # -----------------------------------------
 
         if not valid_questions:
-            raise ValueError('No valid questions.')
 
-        questions=valid_questions[:10]
+            print(
+                "QUIZ FORMAT ERROR: "
+                "No valid questions after validation."
+            )
+
+            print(
+                "RAW AI RESPONSE:",
+                raw
+            )
+
+            raise ValueError(
+                "No valid questions returned."
+            )
+
+        # Keep maximum 10
+        valid_questions = valid_questions[:10]
+
+        # -----------------------------------------
+        # SAVE QUIZ
+        # -----------------------------------------
+
+        conn = db()
+
+        cur = conn.execute(
+            '''
+            INSERT INTO quizzes
+            (user_id, source_id, questions, created_at)
+            VALUES (?, ?, ?, ?)
+            ''',
+            (
+                user['id'],
+                data.document_id,
+                json.dumps(valid_questions),
+                now()
+            )
+        )
+
+        quiz_id = cur.lastrowid
+
+        conn.execute(
+            '''
+            INSERT INTO history
+            (user_id, item_type, title, source_id, created_at, content)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                user['id'],
+                'Quiz',
+                'AI Quiz',
+                data.document_id,
+                now(),
+                json.dumps(valid_questions)
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+        print(
+            f"QUIZ SUCCESS: {len(valid_questions)} questions created."
+        )
+
+        return {
+            'id': quiz_id,
+            'questions': valid_questions
+        }
 
     except Exception as e:
-        print("QUIZ FORMAT ERROR:",str(e))
-        print("RAW AI RESPONSE:",raw[:5000])
+
+        print(
+            "\nQUIZ FORMAT ERROR:",
+            str(e)
+        )
+
+        print(
+            "RAW AI RESPONSE:",
+            raw
+        )
 
         raise HTTPException(
             502,
             'The AI returned an invalid quiz format. Please retry.'
         )
-
-    conn=db()
-
-    cur=conn.execute(
-        'INSERT INTO quizzes(user_id,source_id,questions,created_at) VALUES(?,?,?,?)',
-        (
-            user['id'],
-            data.document_id,
-            json.dumps(questions),
-            now()
-        )
-    )
-
-    qid=cur.lastrowid
-
-    conn.execute(
-        'INSERT INTO history(user_id,item_type,title,source_id,created_at,content) VALUES(?,?,?,?,?,?)',
-        (
-            user['id'],
-            'Quiz',
-            'AI Quiz',
-            data.document_id,
-            now(),
-            json.dumps(questions)
-        )
-    )
-
-    conn.commit()
-
-    conn.close()
-
-    return {
-        'id':qid,
-        'questions':questions
-    }
 
 @app.post('/api/flashcards/generate')
 def flashcards_generate(data:GenerateIn,user=Depends(current_user)):
